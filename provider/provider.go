@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alphagov/paas-aiven-broker/client/elastic"
+	"github.com/alphagov/paas-aiven-broker/client/influxdb"
 	"github.com/alphagov/paas-aiven-broker/provider/aiven"
 	"github.com/pivotal-cf/brokerapi"
 )
@@ -128,8 +129,7 @@ func (ap *AivenProvider) Bind(ctx context.Context, bindData BindData) (binding b
 		Password: password,
 	}
 
-	err = ensureUserAvailability(ctx, credentials.URI)
-	if err != nil {
+	if err = ensureUserAvailability(ctx, serviceType, credentials); err != nil {
 		// Polling is only a best-effort attempt to work around Aiven API delays.
 		// We therefore continue anyway if it times out.
 		if err != context.DeadlineExceeded {
@@ -151,8 +151,27 @@ func buildURI(user, password, host, port string) string {
 	return uri.String()
 }
 
-func ensureUserAvailability(ctx context.Context, uri string) error {
-	client := elastic.New(uri, nil)
+func ensureUserAvailability(
+	ctx context.Context,
+	serviceType string,
+	credentials Credentials,
+) error {
+	if serviceType == "elasticsearch" {
+		return ensureElasticsearchAvailability(ctx, credentials)
+	} else if serviceType == "influxdb" {
+		return ensureInfluxDBAvailability(ctx, credentials)
+	} else {
+		return fmt.Errorf(
+			"Cannot ensure availability for unknown service %s", serviceType,
+		)
+	}
+}
+
+func ensureElasticsearchAvailability(
+	ctx context.Context,
+	credentials Credentials,
+) error {
+	client := elastic.New(credentials.URI, nil)
 	_, err := client.Version()
 	if err == nil {
 		// quick path
@@ -172,7 +191,32 @@ func ensureUserAvailability(ctx context.Context, uri string) error {
 			return ctx.Err()
 		}
 	}
-	return nil
+}
+
+func ensureInfluxDBAvailability(
+	ctx context.Context,
+	credentials Credentials,
+) error {
+	client := influxdb.New(credentials.URI, nil)
+	_, err := client.Ping()
+	if err == nil {
+		// quick path
+		return nil
+	}
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			_, err = client.Ping()
+			if err == nil {
+				return nil
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (ap *AivenProvider) Unbind(ctx context.Context, unbindData UnbindData) (err error) {
